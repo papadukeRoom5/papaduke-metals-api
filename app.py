@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 
 GOLD_API_BASE = "https://api.gold-api.com/price"
-FX_API_URL = "https://v6.exchangerate-api.com/v6/YOUR_API_KEY/latest/USD"
+FX_API_URL = "https://v6.exchangerate-api.com/v6/c7a8f4a6d9b2e1f5/latest/USD"
 THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
 
 OZ_TO_GRAMS = 31.1034768
