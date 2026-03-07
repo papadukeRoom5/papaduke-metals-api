@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 
 GOLD_API_BASE = "https://api.gold-api.com/price"
-FX_API_URL = "https://api.exchangerate.host/latest?base=USD&symbols=AUD,THB,CNY"
+FX_API_URL = "https://api.frankfurter.dev/v1/latest?base=USD&symbols=AUD,THB,CNY"
 THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
 
 def round2(value):
