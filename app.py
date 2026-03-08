@@ -6,19 +6,22 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 
 GOLD_API_BASE = "https://api.gold-api.com/price"
+THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
+OZ_TO_GRAMS = 31.1034768
+
 FX_API_KEY = os.environ.get("FX_API_KEY")
 FX_API_URL = f"https://v6.exchangerate-api.com/v6/{FX_API_KEY}/latest/USD"
-THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
 
-OZ_TO_GRAMS = 31.1034768
 
 def round2(value):
     return round(float(value), 2)
 
+
 def get_json(url):
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(url, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
 
 @app.route("/")
 def home():
@@ -28,9 +31,11 @@ def home():
         "message": "root ok"
     })
 
+
 @app.route("/ping")
 def ping():
     return "pong", 200
+
 
 @app.route("/api/v1/prices")
 def prices():
@@ -107,7 +112,7 @@ def prices():
         thai_gold_bar_buy = float(thai_gold_bar_buy)
         thai_gold_bar_sell = float(thai_gold_bar_sell)
 
-        return jsonify({
+        payload = {
             "status": "ok",
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "usa": {
@@ -139,7 +144,9 @@ def prices():
             "indicators": {
                 "gold_silver_ratio": round2(gold_usd / silver_usd) if silver_usd else None
             }
-        })
+        }
+
+        return jsonify(payload)
 
     except Exception as e:
         print("DEBUG exception:", repr(e))
@@ -147,6 +154,7 @@ def prices():
             "status": "error",
             "message": str(e)
         }), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
