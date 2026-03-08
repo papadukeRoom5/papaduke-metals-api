@@ -1,15 +1,9 @@
 from flask import Flask, jsonify
 import requests
 import os
-import re
 import threading
 import time
 from datetime import datetime, timezone
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
 
 app = Flask(__name__)
 
@@ -18,7 +12,8 @@ app = Flask(__name__)
 # =========================
 GOLD_API_BASE = "https://api.gold-api.com/price"
 THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
-ABC_FULL_PRICE_URL = "https://www.abcbullion.com.au/products-pricing/full-price-list"
+ABC_GOLD_PRODUCTS_URL = "https://new-api.abcbullion.com.au/api/products?parentCategory=gold"
+ABC_SILVER_PRODUCTS_URL = "https://new-api.abcbullion.com.au/api/products?parentCategory=silver"
 
 OZ_TO_GRAMS = 31.1034768
 
@@ -26,13 +21,15 @@ FX_API_KEY = os.environ.get("FX_API_KEY")
 FX_API_URL = f"https://v6.exchangerate-api.com/v6/{FX_API_KEY}/latest/USD"
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; PapaDukeMetalsAPI/1.0; +https://papaduke-metals-api.onrender.com)"
+    "User-Agent": "Mozilla/5.0 (compatible; PapaDukeMetalsAPI/2.0; +https://papaduke-metals-api.onrender.com)"
 }
 
-JSON_TIMEOUT = 10
-HTML_TIMEOUT = 12
-
+JSON_TIMEOUT = 12
 CACHE_TTL_SECONDS = 55
+
+# =========================
+# CACHE
+# =========================
 _cache_lock = threading.Lock()
 _cache_payload = None
 _cache_time = 0.0
@@ -55,6 +52,8 @@ def now_iso():
 def parse_number(value):
     if value is None:
         return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
     return float(str(value).replace(",", "").replace("$", "").strip())
 
 
@@ -64,126 +63,105 @@ def get_json(url, timeout=JSON_TIMEOUT):
     return response.json()
 
 
-def get_text(url, timeout=HTML_TIMEOUT):
-    response = session.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.text
+def find_product_by_name(products, product_name):
+    for item in products:
+        if str(item.get("itemName", "")).strip() == product_name:
+            return item
+    return None
 
 
-def extract_product_prices(text, product_name):
-    pattern = re.compile(
-        re.escape(product_name) + r"\s*\$([\d,]+\.\d+)\s*\$([\d,]+\.\d+)",
-        re.IGNORECASE | re.DOTALL
-    )
-    match = pattern.search(text)
-    if not match:
-        raise ValueError(f"Could not find product row: {product_name}")
-    sell = parse_number(match.group(1))
-    buy = parse_number(match.group(2))
-    return sell, buy
+def get_cached_payload_age():
+    with _cache_lock:
+        if _cache_payload is None:
+            return None
+        return time.time() - _cache_time
 
 
-def html_to_text(html):
-    if BeautifulSoup is not None:
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text("\n", strip=True)
-    else:
-        text = re.sub(r"<script.*?</script>", " ", html, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<style.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<[^>]+>", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    return text
+def get_cached_payload():
+    with _cache_lock:
+        if _cache_payload is None:
+            return None
+        return _cache_payload
+
+
+def set_cached_payload(payload):
+    global _cache_payload, _cache_time
+    with _cache_lock:
+        _cache_payload = payload
+        _cache_time = time.time()
 
 
 # =========================
-# ABC SCRAPER
+# ABC API LOGIC
 # =========================
-def fetch_abc_prices():
+def fetch_abc_reference_prices():
     """
-    Scrape ABC Bullion full product price list and calculate
-    Australian reference premiums.
-
-    Spot source:
-    - Top black header:
-      BUY GOLD 7379.99/oz
-      BUY SILVER 123.46/oz
+    Use ABC Bullion JSON product API instead of scraping HTML.
 
     Reference products:
     - Gold: 1oz ABC Gold Cast Bar 9999
     - Silver: 10oz ABC Silver Cast Bar 9995
+
+    Important:
+    - purchasePrice = ABC buyback price from customer / dealer purchase price
+    - sellPrice     = ABC selling price to customer
     """
-    html = get_text(ABC_FULL_PRICE_URL, timeout=HTML_TIMEOUT)
-    text = html_to_text(html)
 
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n+", "\n", text)
+    gold_products = get_json(ABC_GOLD_PRODUCTS_URL)
+    silver_products = get_json(ABC_SILVER_PRODUCTS_URL)
 
-    # Spot prices from top header
-    gold_spot_match = re.search(r"BUY GOLD\s*([\d,]+\.\d+)/oz", text, re.IGNORECASE)
-    silver_spot_match = re.search(r"BUY SILVER\s*([\d,]+\.\d+)/oz", text, re.IGNORECASE)
-
-    if not gold_spot_match or not silver_spot_match:
-        raise ValueError("Could not parse ABC header spot prices")
-
-    gold_spot_aud_oz = parse_number(gold_spot_match.group(1))
-    silver_spot_aud_oz = parse_number(silver_spot_match.group(1))
-
-    # Reference products
     gold_ref_product = "1oz ABC Gold Cast Bar 9999"
     silver_ref_product = "10oz ABC Silver Cast Bar 9995"
 
-    gold_sell_total, gold_buy_total = extract_product_prices(text, gold_ref_product)
-    silver_sell_total, silver_buy_total = extract_product_prices(text, silver_ref_product)
+    gold_item = find_product_by_name(gold_products, gold_ref_product)
+    silver_item = find_product_by_name(silver_products, silver_ref_product)
 
-    # Gold already 1 oz
-    gold_sell_aud_oz = gold_sell_total
-    gold_buy_aud_oz = gold_buy_total
+    if not gold_item:
+        raise ValueError(f"ABC gold reference product not found: {gold_ref_product}")
+    if not silver_item:
+        raise ValueError(f"ABC silver reference product not found: {silver_ref_product}")
 
-    # Silver is 10 oz total -> convert to per oz
-    silver_sell_aud_oz = silver_sell_total / 10.0
-    silver_buy_aud_oz = silver_buy_total / 10.0
+    gold_weight_oz = parse_number(gold_item.get("itemShopPriceWeightOunces", 0))
+    silver_weight_oz = parse_number(silver_item.get("itemShopPriceWeightOunces", 0))
 
-    # Premium logic
-    gold_premium_aud_oz = gold_sell_aud_oz - gold_spot_aud_oz
-    gold_spread_aud_oz = gold_sell_aud_oz - gold_buy_aud_oz
-    gold_buyback_discount_aud_oz = gold_spot_aud_oz - gold_buy_aud_oz
-    gold_premium_pct = (gold_premium_aud_oz / gold_spot_aud_oz * 100.0) if gold_spot_aud_oz else 0.0
+    if gold_weight_oz <= 0:
+        raise ValueError("ABC gold reference product has invalid ounce weight")
+    if silver_weight_oz <= 0:
+        raise ValueError("ABC silver reference product has invalid ounce weight")
 
-    silver_premium_aud_oz = silver_sell_aud_oz - silver_spot_aud_oz
-    silver_spread_aud_oz = silver_sell_aud_oz - silver_buy_aud_oz
-    silver_buyback_discount_aud_oz = silver_spot_aud_oz - silver_buy_aud_oz
-    silver_premium_pct = (silver_premium_aud_oz / silver_spot_aud_oz * 100.0) if silver_spot_aud_oz else 0.0
+    gold_buy_total = parse_number(gold_item.get("purchasePrice", 0))
+    gold_sell_total = parse_number(gold_item.get("sellPrice", 0))
 
-    live_price_list_time = ""
-    time_match = re.search(
-        r"Live Price List\s*(\d{2}\s+\w{3}\s+\d{4}\s+\d{2}:\d{2})",
-        text,
-        re.IGNORECASE
-    )
-    if time_match:
-        live_price_list_time = time_match.group(1)
+    silver_buy_total = parse_number(silver_item.get("purchasePrice", 0))
+    silver_sell_total = parse_number(silver_item.get("sellPrice", 0))
+
+    if gold_buy_total <= 0 or gold_sell_total <= 0:
+        raise ValueError("ABC gold reference pricing missing or invalid")
+    if silver_buy_total <= 0 or silver_sell_total <= 0:
+        raise ValueError("ABC silver reference pricing missing or invalid")
+
+    # Normalize to per oz
+    gold_buy_aud_oz = gold_buy_total / gold_weight_oz
+    gold_sell_aud_oz = gold_sell_total / gold_weight_oz
+
+    silver_buy_aud_oz = silver_buy_total / silver_weight_oz
+    silver_sell_aud_oz = silver_sell_total / silver_weight_oz
 
     return {
-        "source": "ABC Bullion",
-        "page_time": live_price_list_time,
+        "source": "ABC Bullion API",
+        "abc_page_time": "",
 
         "gold_ref_product": gold_ref_product,
-        "gold_spot_aud_oz": round2(gold_spot_aud_oz),
-        "gold_sell_aud_oz": round2(gold_sell_aud_oz),
+        "gold_ref_category": gold_item.get("categoryName", ""),
+        "gold_ref_weight_oz": round2(gold_weight_oz),
         "gold_buy_aud_oz": round2(gold_buy_aud_oz),
-        "gold_premium_aud_oz": round2(gold_premium_aud_oz),
-        "gold_spread_aud_oz": round2(gold_spread_aud_oz),
-        "gold_buyback_discount_aud_oz": round2(gold_buyback_discount_aud_oz),
-        "gold_premium_pct": round2(gold_premium_pct),
+        "gold_sell_aud_oz": round2(gold_sell_aud_oz),
 
         "silver_ref_product": silver_ref_product,
-        "silver_spot_aud_oz": round2(silver_spot_aud_oz),
-        "silver_sell_aud_oz": round2(silver_sell_aud_oz),
+        "silver_ref_category": silver_item.get("categoryName", ""),
+        "silver_ref_weight_oz": round2(silver_weight_oz),
         "silver_buy_aud_oz": round2(silver_buy_aud_oz),
-        "silver_premium_aud_oz": round2(silver_premium_aud_oz),
-        "silver_spread_aud_oz": round2(silver_spread_aud_oz),
-        "silver_buyback_discount_aud_oz": round2(silver_buyback_discount_aud_oz),
-        "silver_premium_pct": round2(silver_premium_pct)
+        "silver_sell_aud_oz": round2(silver_sell_aud_oz),
     }
 
 
@@ -201,7 +179,8 @@ def build_payload():
     print("DEBUG silver_url:", silver_url)
     print("DEBUG fx_url:", FX_API_URL)
     print("DEBUG thai_url:", THAI_GOLD_API_URL)
-    print("DEBUG abc_url:", ABC_FULL_PRICE_URL)
+    print("DEBUG abc_gold_url:", ABC_GOLD_PRODUCTS_URL)
+    print("DEBUG abc_silver_url:", ABC_SILVER_PRODUCTS_URL)
 
     gold_data = get_json(gold_url)
     print("DEBUG gold_data:", gold_data)
@@ -210,7 +189,7 @@ def build_payload():
     print("DEBUG silver_data:", silver_data)
 
     fx_data = get_json(FX_API_URL)
-    print("DEBUG fx_data:", fx_data)
+    print("DEBUG fx_data loaded")
 
     thai_data = get_json(THAI_GOLD_API_URL)
     print("DEBUG thai_data:", thai_data)
@@ -218,14 +197,14 @@ def build_payload():
     abc_data = None
     abc_error = None
     try:
-        abc_data = fetch_abc_prices()
+        abc_data = fetch_abc_reference_prices()
         print("DEBUG abc_data:", abc_data)
     except Exception as abc_exc:
         abc_error = str(abc_exc)
-        print("DEBUG abc scrape failed:", abc_error)
+        print("DEBUG abc api failed:", abc_error)
 
-    gold_usd = parse_number(gold_data["price"])
-    silver_usd = parse_number(silver_data["price"])
+    gold_usd = parse_number(gold_data.get("price"))
+    silver_usd = parse_number(silver_data.get("price"))
 
     fx_rates = fx_data.get("conversion_rates", {})
     usd_aud = parse_number(fx_rates.get("AUD", 0))
@@ -235,8 +214,9 @@ def build_payload():
     if not usd_aud or not usd_thb or not usd_cny:
         raise ValueError("FX data missing AUD/THB/CNY")
 
-    fallback_gold_aud = gold_usd * usd_aud
-    fallback_silver_aud = silver_usd * usd_aud
+    # Spot conversions
+    gold_spot_aud_oz = gold_usd * usd_aud
+    silver_spot_aud_oz = silver_usd * usd_aud
 
     gold_cny_g = (gold_usd * usd_cny) / OZ_TO_GRAMS
     silver_cny_g = (silver_usd * usd_cny) / OZ_TO_GRAMS
@@ -266,33 +246,88 @@ def build_payload():
     thai_gold_bar_buy = parse_number(thai_gold_bar_buy_raw)
     thai_gold_bar_sell = parse_number(thai_gold_bar_sell_raw)
 
-    australia_payload = {
-        "source": "ABC Bullion" if abc_data else "fallback-converted-spot",
-        "abc_page_time": abc_data["page_time"] if abc_data else "",
-        "gold_ref_product": abc_data["gold_ref_product"] if abc_data else "",
-        "silver_ref_product": abc_data["silver_ref_product"] if abc_data else "",
+    # Australia payload
+    if abc_data:
+        gold_buy_aud_oz = abc_data["gold_buy_aud_oz"]
+        gold_sell_aud_oz = abc_data["gold_sell_aud_oz"]
+        silver_buy_aud_oz = abc_data["silver_buy_aud_oz"]
+        silver_sell_aud_oz = abc_data["silver_sell_aud_oz"]
 
-        # Legacy fields for ESP32 compatibility
-        "gold_aud_oz": round2(abc_data["gold_spot_aud_oz"] if abc_data else fallback_gold_aud),
-        "silver_aud_oz": round2(abc_data["silver_spot_aud_oz"] if abc_data else fallback_silver_aud),
-        "gold_premium_aud": round2(abc_data["gold_premium_aud_oz"] if abc_data else 0),
-        "silver_premium_aud": round2(abc_data["silver_premium_aud_oz"] if abc_data else 0),
+        gold_premium_aud_oz = gold_sell_aud_oz - gold_spot_aud_oz
+        gold_spread_aud_oz = gold_sell_aud_oz - gold_buy_aud_oz
+        gold_buyback_discount_aud_oz = gold_spot_aud_oz - gold_buy_aud_oz
+        gold_premium_pct = (gold_premium_aud_oz / gold_spot_aud_oz * 100.0) if gold_spot_aud_oz else 0.0
 
-        # Explicit fields
-        "gold_spot_aud_oz": round2(abc_data["gold_spot_aud_oz"] if abc_data else fallback_gold_aud),
-        "gold_sell_aud_oz": round2(abc_data["gold_sell_aud_oz"] if abc_data else 0),
-        "gold_buy_aud_oz": round2(abc_data["gold_buy_aud_oz"] if abc_data else 0),
-        "gold_spread_aud_oz": round2(abc_data["gold_spread_aud_oz"] if abc_data else 0),
-        "gold_buyback_discount_aud_oz": round2(abc_data["gold_buyback_discount_aud_oz"] if abc_data else 0),
-        "gold_premium_pct": round2(abc_data["gold_premium_pct"] if abc_data else 0),
+        silver_premium_aud_oz = silver_sell_aud_oz - silver_spot_aud_oz
+        silver_spread_aud_oz = silver_sell_aud_oz - silver_buy_aud_oz
+        silver_buyback_discount_aud_oz = silver_spot_aud_oz - silver_buy_aud_oz
+        silver_premium_pct = (silver_premium_aud_oz / silver_spot_aud_oz * 100.0) if silver_spot_aud_oz else 0.0
 
-        "silver_spot_aud_oz": round2(abc_data["silver_spot_aud_oz"] if abc_data else fallback_silver_aud),
-        "silver_sell_aud_oz": round2(abc_data["silver_sell_aud_oz"] if abc_data else 0),
-        "silver_buy_aud_oz": round2(abc_data["silver_buy_aud_oz"] if abc_data else 0),
-        "silver_spread_aud_oz": round2(abc_data["silver_spread_aud_oz"] if abc_data else 0),
-        "silver_buyback_discount_aud_oz": round2(abc_data["silver_buyback_discount_aud_oz"] if abc_data else 0),
-        "silver_premium_pct": round2(abc_data["silver_premium_pct"] if abc_data else 0)
-    }
+        australia_payload = {
+            "source": abc_data["source"],
+            "abc_page_time": abc_data["abc_page_time"],
+
+            "gold_ref_product": abc_data["gold_ref_product"],
+            "gold_ref_category": abc_data["gold_ref_category"],
+            "gold_ref_weight_oz": abc_data["gold_ref_weight_oz"],
+
+            "silver_ref_product": abc_data["silver_ref_product"],
+            "silver_ref_category": abc_data["silver_ref_category"],
+            "silver_ref_weight_oz": abc_data["silver_ref_weight_oz"],
+
+            # Legacy fields for ESP32 compatibility
+            "gold_aud_oz": round2(gold_spot_aud_oz),
+            "silver_aud_oz": round2(silver_spot_aud_oz),
+            "gold_premium_aud": round2(gold_premium_aud_oz),
+            "silver_premium_aud": round2(silver_premium_aud_oz),
+
+            # Explicit fields
+            "gold_spot_aud_oz": round2(gold_spot_aud_oz),
+            "gold_sell_aud_oz": round2(gold_sell_aud_oz),
+            "gold_buy_aud_oz": round2(gold_buy_aud_oz),
+            "gold_spread_aud_oz": round2(gold_spread_aud_oz),
+            "gold_buyback_discount_aud_oz": round2(gold_buyback_discount_aud_oz),
+            "gold_premium_pct": round2(gold_premium_pct),
+
+            "silver_spot_aud_oz": round2(silver_spot_aud_oz),
+            "silver_sell_aud_oz": round2(silver_sell_aud_oz),
+            "silver_buy_aud_oz": round2(silver_buy_aud_oz),
+            "silver_spread_aud_oz": round2(silver_spread_aud_oz),
+            "silver_buyback_discount_aud_oz": round2(silver_buyback_discount_aud_oz),
+            "silver_premium_pct": round2(silver_premium_pct),
+        }
+    else:
+        australia_payload = {
+            "source": "fallback-converted-spot",
+            "abc_page_time": "",
+            "gold_ref_product": "",
+            "gold_ref_category": "",
+            "gold_ref_weight_oz": 0,
+            "silver_ref_product": "",
+            "silver_ref_category": "",
+            "silver_ref_weight_oz": 0,
+
+            # Legacy fields
+            "gold_aud_oz": round2(gold_spot_aud_oz),
+            "silver_aud_oz": round2(silver_spot_aud_oz),
+            "gold_premium_aud": 0.0,
+            "silver_premium_aud": 0.0,
+
+            # Explicit fields
+            "gold_spot_aud_oz": round2(gold_spot_aud_oz),
+            "gold_sell_aud_oz": 0.0,
+            "gold_buy_aud_oz": 0.0,
+            "gold_spread_aud_oz": 0.0,
+            "gold_buyback_discount_aud_oz": 0.0,
+            "gold_premium_pct": 0.0,
+
+            "silver_spot_aud_oz": round2(silver_spot_aud_oz),
+            "silver_sell_aud_oz": 0.0,
+            "silver_buy_aud_oz": 0.0,
+            "silver_spread_aud_oz": 0.0,
+            "silver_buyback_discount_aud_oz": 0.0,
+            "silver_premium_pct": 0.0,
+        }
 
     payload = {
         "status": "ok",
@@ -322,34 +357,13 @@ def build_payload():
             "gold_silver_ratio": round2(gold_usd / silver_usd) if silver_usd else None
         },
         "debug": {
-            "abc_scrape_ok": abc_data is not None,
+            "abc_api_ok": abc_data is not None,
             "abc_error": abc_error,
             "cache_hit": False
         }
     }
 
     return payload
-
-
-def get_cached_payload_age():
-    with _cache_lock:
-        if _cache_payload is None:
-            return None
-        return time.time() - _cache_time
-
-
-def get_cached_payload():
-    with _cache_lock:
-        if _cache_payload is None:
-            return None
-        return _cache_payload
-
-
-def set_cached_payload(payload):
-    global _cache_payload, _cache_time
-    with _cache_lock:
-        _cache_payload = payload
-        _cache_time = time.time()
 
 
 # =========================
