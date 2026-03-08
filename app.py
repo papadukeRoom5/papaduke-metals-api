@@ -24,9 +24,6 @@ def get_json(url):
 
 
 def parse_number(value):
-    """
-    Safely convert strings like '77,750.00' or numbers into float.
-    """
     if value is None:
         return 0.0
     return float(str(value).replace(",", "").strip())
@@ -166,4 +163,4 @@ def prices():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
