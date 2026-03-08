@@ -103,43 +103,47 @@ def fetch_abc_prices():
     Scrape ABC Bullion full product price list and calculate
     Australian reference premiums.
 
-    Chosen reference products:
+    Spot source:
+    - Top black header:
+      BUY GOLD 7379.99/oz
+      BUY SILVER 123.46/oz
+
+    Reference products:
     - Gold: 1oz ABC Gold Cast Bar 9999
     - Silver: 10oz ABC Silver Cast Bar 9995
     """
     html = get_text(ABC_FULL_PRICE_URL, timeout=HTML_TIMEOUT)
     text = html_to_text(html)
 
-    # Normalize whitespace
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n+", "\n", text)
 
-    # Extract all spot values in order they appear
-    spot_matches = re.findall(
-        r"SPOT PRICE PER TROY OUNCE\s*\$([\d,]+\.\d+)",
-        text,
-        re.IGNORECASE
-    )
+    # Spot prices from top header
+    gold_spot_match = re.search(r"BUY GOLD\s*([\d,]+\.\d+)/oz", text, re.IGNORECASE)
+    silver_spot_match = re.search(r"BUY SILVER\s*([\d,]+\.\d+)/oz", text, re.IGNORECASE)
 
-    if len(spot_matches) < 2:
-        raise ValueError("Could not parse ABC spot prices")
+    if not gold_spot_match or not silver_spot_match:
+        raise ValueError("Could not parse ABC header spot prices")
 
-    # ABC page order is gold first, silver second
-    gold_spot_aud_oz = parse_number(spot_matches[0])
-    silver_spot_aud_oz = parse_number(spot_matches[1])
+    gold_spot_aud_oz = parse_number(gold_spot_match.group(1))
+    silver_spot_aud_oz = parse_number(silver_spot_match.group(1))
 
+    # Reference products
     gold_ref_product = "1oz ABC Gold Cast Bar 9999"
     silver_ref_product = "10oz ABC Silver Cast Bar 9995"
 
     gold_sell_total, gold_buy_total = extract_product_prices(text, gold_ref_product)
     silver_sell_total, silver_buy_total = extract_product_prices(text, silver_ref_product)
 
+    # Gold already 1 oz
     gold_sell_aud_oz = gold_sell_total
     gold_buy_aud_oz = gold_buy_total
 
+    # Silver is 10 oz total -> convert to per oz
     silver_sell_aud_oz = silver_sell_total / 10.0
     silver_buy_aud_oz = silver_buy_total / 10.0
 
+    # Premium logic
     gold_premium_aud_oz = gold_sell_aud_oz - gold_spot_aud_oz
     gold_spread_aud_oz = gold_sell_aud_oz - gold_buy_aud_oz
     gold_buyback_discount_aud_oz = gold_spot_aud_oz - gold_buy_aud_oz
