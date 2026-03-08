@@ -23,6 +23,15 @@ def get_json(url):
     return response.json()
 
 
+def parse_number(value):
+    """
+    Safely convert strings like '77,750.00' or numbers into float.
+    """
+    if value is None:
+        return 0.0
+    return float(str(value).replace(",", "").strip())
+
+
 @app.route("/")
 def home():
     return jsonify({
@@ -66,13 +75,13 @@ def prices():
         thai_data = get_json(THAI_GOLD_API_URL)
         print("DEBUG thai_data:", thai_data)
 
-        gold_usd = float(gold_data["price"])
-        silver_usd = float(silver_data["price"])
+        gold_usd = parse_number(gold_data["price"])
+        silver_usd = parse_number(silver_data["price"])
 
         fx_rates = fx_data.get("conversion_rates", {})
-        usd_aud = float(fx_rates.get("AUD", 0))
-        usd_thb = float(fx_rates.get("THB", 0))
-        usd_cny = float(fx_rates.get("CNY", 0))
+        usd_aud = parse_number(fx_rates.get("AUD", 0))
+        usd_thb = parse_number(fx_rates.get("THB", 0))
+        usd_cny = parse_number(fx_rates.get("CNY", 0))
 
         if not usd_aud or not usd_thb or not usd_cny:
             return jsonify({
@@ -87,7 +96,7 @@ def prices():
         gold_cny_g = (gold_usd * usd_cny) / OZ_TO_GRAMS
         silver_cny_g = (silver_usd * usd_cny) / OZ_TO_GRAMS
 
-        thai_gold_bar_buy = (
+        thai_gold_bar_buy_raw = (
             thai_data.get("response", {})
             .get("price", {})
             .get("gold_bar", {})
@@ -98,7 +107,7 @@ def prices():
             .get("buy")
         ) or 0
 
-        thai_gold_bar_sell = (
+        thai_gold_bar_sell_raw = (
             thai_data.get("response", {})
             .get("price", {})
             .get("gold_bar", {})
@@ -109,8 +118,8 @@ def prices():
             .get("sell")
         ) or 0
 
-        thai_gold_bar_buy = float(thai_gold_bar_buy)
-        thai_gold_bar_sell = float(thai_gold_bar_sell)
+        thai_gold_bar_buy = parse_number(thai_gold_bar_buy_raw)
+        thai_gold_bar_sell = parse_number(thai_gold_bar_sell_raw)
 
         payload = {
             "status": "ok",
