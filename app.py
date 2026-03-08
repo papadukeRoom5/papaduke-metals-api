@@ -1,11 +1,13 @@
 from flask import Flask, jsonify
 import requests
+import os
 from datetime import datetime, timezone
 
 app = Flask(__name__)
 
 GOLD_API_BASE = "https://api.gold-api.com/price"
-FX_API_URL = "https://v6.exchangerate-api.com/v6/c7a8f4a6d9b2e1f5/latest/USD"
+FX_API_KEY = os.environ.get("FX_API_KEY")
+FX_API_URL = f"https://v6.exchangerate-api.com/v6/{FX_API_KEY}/latest/USD"
 THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
 
 OZ_TO_GRAMS = 31.1034768
@@ -33,10 +35,31 @@ def ping():
 @app.route("/api/v1/prices")
 def prices():
     try:
-        gold_data = get_json(f"{GOLD_API_BASE}/XAU")
-        silver_data = get_json(f"{GOLD_API_BASE}/XAG")
+        if not FX_API_KEY:
+            return jsonify({
+                "status": "error",
+                "message": "FX_API_KEY is not set"
+            }), 500
+
+        gold_url = f"{GOLD_API_BASE}/XAU"
+        silver_url = f"{GOLD_API_BASE}/XAG"
+
+        print("DEBUG gold_url:", gold_url)
+        print("DEBUG silver_url:", silver_url)
+        print("DEBUG fx_url:", FX_API_URL)
+        print("DEBUG thai_url:", THAI_GOLD_API_URL)
+
+        gold_data = get_json(gold_url)
+        print("DEBUG gold_data:", gold_data)
+
+        silver_data = get_json(silver_url)
+        print("DEBUG silver_data:", silver_data)
+
         fx_data = get_json(FX_API_URL)
+        print("DEBUG fx_data:", fx_data)
+
         thai_data = get_json(THAI_GOLD_API_URL)
+        print("DEBUG thai_data:", thai_data)
 
         gold_usd = float(gold_data["price"])
         silver_usd = float(silver_data["price"])
@@ -47,7 +70,11 @@ def prices():
         usd_cny = float(fx_rates.get("CNY", 0))
 
         if not usd_aud or not usd_thb or not usd_cny:
-            raise ValueError(f"FX API missing AUD/THB/CNY: {fx_data}")
+            return jsonify({
+                "status": "error",
+                "message": "FX data missing AUD/THB/CNY",
+                "fx_data": fx_data
+            }), 500
 
         gold_aud = gold_usd * usd_aud
         silver_aud = silver_usd * usd_aud
@@ -115,6 +142,7 @@ def prices():
         })
 
     except Exception as e:
+        print("DEBUG exception:", repr(e))
         return jsonify({
             "status": "error",
             "message": str(e)
