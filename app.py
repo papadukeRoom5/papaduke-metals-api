@@ -230,18 +230,26 @@ def fetch_abc_reference_prices():
 def fetch_thai_silver():
     data = get_json(BOWINS_SILVER_API_URL)
 
+    if isinstance(data, list):
+        if not data:
+            raise ValueError("Bowins silver response list is empty")
+        row = data[0]
+    elif isinstance(data, dict):
+        row = data
+    else:
+        raise ValueError("Bowins silver response is not dict or list")
+
     return {
-        "buy_thb": parse_number(data.get("buy")),
-        "sell_thb": parse_number(data.get("sell")),
-        "change_thb": parse_number(data.get("PREVIOUS_PRICE")),
-        "update_time": data.get("created", ""),
-        "round": data.get("no", ""),
-        "spot_ref": parse_number(data.get("rate_spot")),
-        "fx_ref": parse_number(data.get("rate_exchange")),
-        "premium_ref": parse_number(data.get("rate_pmdc")),
+        "buy_thb": parse_number(row.get("buy")),
+        "sell_thb": parse_number(row.get("sell")),
+        "change_thb": parse_number(row.get("PREVIOUS_PRICE")),
+        "update_time": row.get("created", ""),
+        "round": row.get("no", ""),
+        "spot_ref": parse_number(row.get("rate_spot")),
+        "fx_ref": parse_number(row.get("rate_exchange")),
+        "premium_ref": parse_number(row.get("rate_pmdc")),
         "source": "Bowins"
     }
-
 
 # ======================================================
 # BUILD PAYLOAD
