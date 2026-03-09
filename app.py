@@ -21,6 +21,8 @@ ABC_SILVER_PRODUCTS_URL = "https://new-api.abcbullion.com.au/api/products?parent
 SGE_GOLD_URL = "https://en.sge.com.cn/data_BenchmarkPrice_Daily"
 SGE_SILVER_URL = "https://en.sge.com.cn/data/data_silver_daily"
 
+BOWINS_SILVER_API_URL = "https://besserver.dyndns.org/ipn/response_silverbar.php"
+
 OZ_TO_GRAMS = 31.1034768
 
 FX_API_KEY = "d97e47cfb06d344fb3fffdc1"
@@ -217,6 +219,25 @@ def fetch_abc_reference_prices():
 
 
 # ======================================================
+# THAILAND SILVER (BOWINS)
+# ======================================================
+def fetch_thai_silver():
+    data = get_json(BOWINS_SILVER_API_URL)
+
+    return {
+        "buy_thb": parse_number(data.get("buy")),
+        "sell_thb": parse_number(data.get("sell")),
+        "change_thb": parse_number(data.get("PREVIOUS_PRICE")),
+        "update_time": data.get("created", ""),
+        "round": data.get("no", ""),
+        "spot_ref": parse_number(data.get("rate_spot")),
+        "fx_ref": parse_number(data.get("rate_exchange")),
+        "premium_ref": parse_number(data.get("rate_pmdc")),
+        "source": "Bowins"
+    }
+
+
+# ======================================================
 # BUILD PAYLOAD
 # ======================================================
 def build_payload():
@@ -227,6 +248,7 @@ def build_payload():
 
     abc = fetch_abc_reference_prices()
     shanghai = fetch_shanghai_benchmark_prices()
+    thai_silver = fetch_thai_silver()
 
     gold_usd = parse_number(gold_data["price"])
     silver_usd = parse_number(silver_data["price"])
@@ -258,8 +280,6 @@ def build_payload():
 
     # -----------------------
     # Thailand gold bar
-    # Real path:
-    # response.price.gold_bar.buy / sell
     # -----------------------
     thai_gold_bar_buy = parse_number(
         thai_data.get("response", {})
@@ -315,11 +335,9 @@ def build_payload():
         },
 
         "china": {
-            # latest price aliases for compatibility with ESP32
             "gold_cny_g": round2(china_gold_pm),
             "silver_cny_g": round4(china_silver_pm),
 
-            # proper SGE AM/PM model
             "trade_date": shanghai["trade_date"],
             "gold_am_cny_g": round2(shanghai["gold_am_cny_g"]),
             "gold_pm_cny_g": round2(shanghai["gold_pm_cny_g"]),
@@ -331,7 +349,6 @@ def build_payload():
             "silver_spread_cny_g": round4(shanghai["silver_spread_cny_g"]),
             "silver_move_pct": round2(shanghai["silver_move_pct"]),
 
-            # world reference kept for future use
             "gold_ref_cny_g": round2(gold_ref_cny_g),
             "silver_ref_cny_g": round4(silver_ref_cny_g),
 
@@ -341,7 +358,18 @@ def build_payload():
         "thailand": {
             "gold_bar_buy_thb": round2(thai_gold_bar_buy),
             "gold_bar_sell_thb": round2(thai_gold_bar_sell),
-            "spread_thb": round2(thai_gold_bar_sell - thai_gold_bar_buy)
+            "spread_thb": round2(thai_gold_bar_sell - thai_gold_bar_buy),
+
+            "silver_buy_thb": round2(thai_silver["buy_thb"]),
+            "silver_sell_thb": round2(thai_silver["sell_thb"]),
+            "silver_change_thb": round2(thai_silver["change_thb"]),
+            "silver_update_time": thai_silver["update_time"],
+            "silver_round": thai_silver["round"],
+
+            "silver_spot_ref": round4(thai_silver["spot_ref"]),
+            "silver_fx_ref": round4(thai_silver["fx_ref"]),
+            "silver_premium_ref": round4(thai_silver["premium_ref"]),
+            "silver_source": thai_silver["source"]
         },
 
         "fx": {
