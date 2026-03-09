@@ -10,7 +10,7 @@ app = Flask(__name__)
 # =========================
 # CONFIG
 # =========================
-APP_VERSION = "sge-am-pm-v3"
+APP_VERSION = "sge-am-pm-v4"
 
 GOLD_API_BASE = "https://api.gold-api.com/price"
 THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
@@ -67,7 +67,11 @@ def parse_number(value):
     s = str(value).replace(",", "").replace("$", "").strip()
     if not s:
         return 0.0
-    return float(s)
+
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
 
 
 def get_json(url):
@@ -82,16 +86,19 @@ def safe_pct(change, base):
     return (change / base) * 100.0
 
 
+def safe_fetch(name, func, fallback, errors):
+    try:
+        return func()
+    except Exception as e:
+        errors[name] = str(e)
+        print(f"[ERROR] {name}: {e}")
+        return fallback
+
+
 # ======================================================
 # SGE BENCHMARK PARSER
 # ======================================================
 def extract_sge_row(text, contract_code):
-    """
-    Works with SGE one-line text like:
-    Trade Date Contract Benchmark Price AM Benchmark Price PM
-    20260309 SHAU 1138.44 1137.97
-    20260309 SHAG 20497 21410
-    """
     cleaned = re.sub(r"<[^>]+>", " ", text)
     cleaned = cleaned.replace("&nbsp;", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -126,9 +133,6 @@ def fetch_shanghai_benchmark_prices():
         "error_silver": None,
     }
 
-    # -----------------------
-    # GOLD (already CNY/g)
-    # -----------------------
     try:
         r = session.get(SGE_GOLD_URL, timeout=JSON_TIMEOUT)
         r.raise_for_status()
@@ -148,9 +152,6 @@ def fetch_shanghai_benchmark_prices():
     except Exception as e:
         result["error_gold"] = str(e)
 
-    # -----------------------
-    # SILVER (SGE gives CNY/kg -> convert to CNY/g)
-    # -----------------------
     try:
         r = session.get(SGE_SILVER_URL, timeout=JSON_TIMEOUT)
         r.raise_for_status()
@@ -200,14 +201,19 @@ def fetch_abc_reference_prices():
     if not silver_item:
         raise ValueError("ABC silver reference product not found")
 
-    gold_weight = parse_number(gold_item["itemShopPriceWeightOunces"])
-    silver_weight = parse_number(silver_item["itemShopPriceWeightOunces"])
+    gold_weight = parse_number(gold_item.get("itemShopPriceWeightOunces"))
+    silver_weight = parse_number(silver_item.get("itemShopPriceWeightOunces"))
 
-    gold_buy = parse_number(gold_item["purchasePrice"])
-    gold_sell = parse_number(gold_item["sellPrice"])
+    if gold_weight <= 0:
+        raise ValueError("ABC gold weight invalid")
+    if silver_weight <= 0:
+        raise ValueError("ABC silver weight invalid")
 
-    silver_buy = parse_number(silver_item["purchasePrice"])
-    silver_sell = parse_number(silver_item["sellPrice"])
+    gold_buy = parse_number(gold_item.get("purchasePrice"))
+    gold_sell = parse_number(gold_item.get("sellPrice"))
+
+    silver_buy = parse_number(silver_item.get("purchasePrice"))
+    silver_sell = parse_number(silver_item.get("sellPrice"))
 
     return {
         "gold_buy_aud_oz": gold_buy / gold_weight,
@@ -241,25 +247,96 @@ def fetch_thai_silver():
 # BUILD PAYLOAD
 # ======================================================
 def build_payload():
-    gold_data = get_json(f"{GOLD_API_BASE}/XAU")
-    silver_data = get_json(f"{GOLD_API_BASE}/XAG")
-    fx_data = get_json(FX_API_URL)
-    thai_data = get_json(THAI_GOLD_API_URL)
+    errors = {}
 
-    abc = fetch_abc_reference_prices()
-    shanghai = fetch_shanghai_benchmark_prices()
-    thai_silver = fetch_thai_silver()
+    gold_data = safe_fetch(
+        "gold_api_xau",
+        lambda: get_json(f"{GOLD_API_BASE}/XAU"),
+        {},
+        errors
+    )
 
-    gold_usd = parse_number(gold_data["price"])
-    silver_usd = parse_number(silver_data["price"])
+    silver_data = safe_fetch(
+        "gold_api_xag",
+        lambda: get_json(f"{GOLD_API_BASE}/XAG"),
+        {},
+        errors
+    )
 
-    usd_aud = parse_number(fx_data["conversion_rates"]["AUD"])
-    usd_thb = parse_number(fx_data["conversion_rates"]["THB"])
-    usd_cny = parse_number(fx_data["conversion_rates"]["CNY"])
+    fx_data = safe_fetch(
+        "fx_api",
+        lambda: get_json(FX_API_URL),
+        {},
+        errors
+    )
 
-    # -----------------------
-    # Australia spot reference
-    # -----------------------
+    thai_data = safe_fetch(
+        "thai_gold_api",
+        lambda: get_json(THAI_GOLD_API_URL),
+        {},
+        errors
+    )
+
+    abc = safe_fetch(
+        "abc_reference",
+        fetch_abc_reference_prices,
+        {
+            "gold_buy_aud_oz": 0.0,
+            "gold_sell_aud_oz": 0.0,
+            "silver_buy_aud_oz": 0.0,
+            "silver_sell_aud_oz": 0.0,
+            "source": "ABC Bullion"
+        },
+        errors
+    )
+
+    shanghai = safe_fetch(
+        "shanghai_benchmark",
+        fetch_shanghai_benchmark_prices,
+        {
+            "trade_date": "",
+            "gold_am_cny_g": 0.0,
+            "gold_pm_cny_g": 0.0,
+            "gold_spread_cny_g": 0.0,
+            "gold_move_pct": 0.0,
+            "silver_am_cny_g": 0.0,
+            "silver_pm_cny_g": 0.0,
+            "silver_spread_cny_g": 0.0,
+            "silver_move_pct": 0.0,
+            "source": "SGE Benchmark",
+            "ok_gold": False,
+            "ok_silver": False,
+            "error_gold": "fallback",
+            "error_silver": "fallback",
+        },
+        errors
+    )
+
+    thai_silver = safe_fetch(
+        "thai_silver_bowins",
+        fetch_thai_silver,
+        {
+            "buy_thb": 0.0,
+            "sell_thb": 0.0,
+            "change_thb": 0.0,
+            "update_time": "",
+            "round": "",
+            "spot_ref": 0.0,
+            "fx_ref": 0.0,
+            "premium_ref": 0.0,
+            "source": "Bowins"
+        },
+        errors
+    )
+
+    gold_usd = parse_number(gold_data.get("price", 0))
+    silver_usd = parse_number(silver_data.get("price", 0))
+
+    rates = fx_data.get("conversion_rates", {})
+    usd_aud = parse_number(rates.get("AUD"))
+    usd_thb = parse_number(rates.get("THB"))
+    usd_cny = parse_number(rates.get("CNY"))
+
     gold_spot_aud_oz = gold_usd * usd_aud
     silver_spot_aud_oz = silver_usd * usd_aud
 
@@ -269,18 +346,12 @@ def build_payload():
     gold_buyback_discount_aud_oz = gold_spot_aud_oz - abc["gold_buy_aud_oz"]
     silver_buyback_discount_aud_oz = silver_spot_aud_oz - abc["silver_buy_aud_oz"]
 
-    # -----------------------
-    # China world reference
-    # -----------------------
-    gold_ref_cny_g = (gold_usd * usd_cny) / OZ_TO_GRAMS
-    silver_ref_cny_g = (silver_usd * usd_cny) / OZ_TO_GRAMS
+    gold_ref_cny_g = (gold_usd * usd_cny) / OZ_TO_GRAMS if usd_cny > 0 else 0.0
+    silver_ref_cny_g = (silver_usd * usd_cny) / OZ_TO_GRAMS if usd_cny > 0 else 0.0
 
     china_gold_pm = shanghai["gold_pm_cny_g"]
     china_silver_pm = shanghai["silver_pm_cny_g"]
 
-    # -----------------------
-    # Thailand gold bar
-    # -----------------------
     thai_gold_bar_buy = parse_number(
         thai_data.get("response", {})
                  .get("price", {})
@@ -294,6 +365,8 @@ def build_payload():
                  .get("gold_bar", {})
                  .get("sell", 0)
     )
+
+    gold_silver_ratio = round2(gold_usd / silver_usd) if silver_usd > 0 else 0.0
 
     payload = {
         "status": "ok",
@@ -379,7 +452,7 @@ def build_payload():
         },
 
         "indicators": {
-            "gold_silver_ratio": round2(gold_usd / silver_usd)
+            "gold_silver_ratio": gold_silver_ratio
         },
 
         "debug": {
@@ -387,7 +460,9 @@ def build_payload():
             "sge_silver_ok": shanghai["ok_silver"],
             "sge_gold_error": shanghai["error_gold"],
             "sge_silver_error": shanghai["error_silver"]
-        }
+        },
+
+        "errors": errors
     }
 
     return payload
