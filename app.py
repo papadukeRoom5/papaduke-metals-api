@@ -12,13 +12,9 @@ app = Flask(__name__)
 # =========================
 GOLD_API_BASE = "https://api.gold-api.com/price"
 THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
+
 ABC_GOLD_PRODUCTS_URL = "https://new-api.abcbullion.com.au/api/products?parentCategory=gold"
 ABC_SILVER_PRODUCTS_URL = "https://new-api.abcbullion.com.au/api/products?parentCategory=silver"
-
-# Optional real Shanghai local sources
-# Leave unset for now if you do not yet have a real Shanghai feed
-SHANGHAI_GOLD_API_URL = os.environ.get("SHANGHAI_GOLD_API_URL", "").strip()
-SHANGHAI_SILVER_API_URL = os.environ.get("SHANGHAI_SILVER_API_URL", "").strip()
 
 OZ_TO_GRAMS = 31.1034768
 
@@ -26,11 +22,14 @@ FX_API_KEY = os.environ.get("FX_API_KEY")
 FX_API_URL = f"https://v6.exchangerate-api.com/v6/{FX_API_KEY}/latest/USD"
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; PapaDukeMetalsAPI/3.0; +https://papaduke-metals-api.onrender.com)"
+    "User-Agent": "Mozilla/5.0 (PapaDukeMetalsAPI)"
 }
 
 JSON_TIMEOUT = 12
 CACHE_TTL_SECONDS = 55
+
+session = requests.Session()
+session.headers.update(HTTP_HEADERS)
 
 # =========================
 # CACHE
@@ -39,14 +38,9 @@ _cache_lock = threading.Lock()
 _cache_payload = None
 _cache_time = 0.0
 
-session = requests.Session()
-session.headers.update(HTTP_HEADERS)
 
-# =========================
-# HELPERS
-# =========================
-def round2(value):
-    return round(float(value), 2)
+def round2(v):
+    return round(float(v), 2)
 
 
 def now_iso():
@@ -61,499 +55,217 @@ def parse_number(value):
     return float(str(value).replace(",", "").replace("$", "").strip())
 
 
-def get_json(url, timeout=JSON_TIMEOUT):
-    response = session.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+def get_json(url):
+    r = session.get(url, timeout=JSON_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
 
-def find_product_by_name(products, product_name):
-    for item in products:
-        if str(item.get("itemName", "")).strip() == product_name:
-            return item
-    return None
-
-
-def get_cached_payload_age():
-    with _cache_lock:
-        if _cache_payload is None:
-            return None
-        return time.time() - _cache_time
-
-
-def get_cached_payload():
-    with _cache_lock:
-        if _cache_payload is None:
-            return None
-        return _cache_payload
-
-
-def set_cached_payload(payload):
-    global _cache_payload, _cache_time
-    with _cache_lock:
-        _cache_payload = payload
-        _cache_time = time.time()
-
-
-def safe_pct(numerator, denominator):
-    if not denominator:
-        return 0.0
-    return (numerator / denominator) * 100.0
-
-
-def nested_get(obj, path):
-    cur = obj
-    for key in path:
-        if not isinstance(cur, dict) or key not in cur:
-            return None
-        cur = cur[key]
-    return cur
-
-
-def first_number_from_paths(obj, paths):
-    for path in paths:
-        raw = nested_get(obj, path)
-        if raw is None:
-            continue
-        try:
-            return parse_number(raw)
-        except Exception:
-            continue
-    return 0.0
-
-
-# =========================
-# OPTIONAL SHANGHAI LOCAL FEED
-# =========================
+# ======================================================
+# ROBUST SHANGHAI BENCHMARK PARSER
+# ======================================================
 def fetch_shanghai_local_prices():
-    """
-    Optional real local Shanghai prices.
-    This function is intentionally flexible because different feeds return different JSON shapes.
-
-    Expected output:
-    {
-        "gold_cny_g": float or 0.0,
-        "silver_cny_g": float or 0.0,
-        "source": "..."
-    }
-
-    If no real local source is configured, returns None.
-    """
-
-    if not SHANGHAI_GOLD_API_URL and not SHANGHAI_SILVER_API_URL:
-        return None
 
     result = {
         "gold_cny_g": 0.0,
         "silver_cny_g": 0.0,
-        "source": "configured-shanghai-feed"
+        "source": "SGE Benchmark"
     }
 
-    if SHANGHAI_GOLD_API_URL:
-        gold_json = get_json(SHANGHAI_GOLD_API_URL)
+    # -----------------------
+    # GOLD
+    # -----------------------
+    try:
 
-        # Adjust candidate paths to match your chosen Shanghai feed
-        result["gold_cny_g"] = first_number_from_paths(gold_json, [
-            ["gold_cny_g"],
-            ["price"],
-            ["data", "price"],
-            ["data", "gold_cny_g"],
-            ["response", "price"],
-            ["response", "gold_cny_g"]
-        ])
+        url = "https://en.sge.com.cn/data_BenchmarkPrice_Daily"
 
-    if SHANGHAI_SILVER_API_URL:
-        silver_json = get_json(SHANGHAI_SILVER_API_URL)
+        r = session.get(url, timeout=JSON_TIMEOUT)
+        r.raise_for_status()
 
-        # Adjust candidate paths to match your chosen Shanghai feed
-        result["silver_cny_g"] = first_number_from_paths(silver_json, [
-            ["silver_cny_g"],
-            ["price"],
-            ["data", "price"],
-            ["data", "silver_cny_g"],
-            ["response", "price"],
-            ["response", "silver_cny_g"]
-        ])
+        lines = r.text.splitlines()
+
+        for line in lines:
+
+            parts = line.strip().split()
+
+            if len(parts) >= 3 and parts[1] == "SHAU":
+
+                price = parse_number(parts[2])
+
+                if price > 0:
+                    result["gold_cny_g"] = price
+                    break
+
+    except Exception as e:
+        print("SGE GOLD ERROR:", e)
+
+    # -----------------------
+    # SILVER
+    # -----------------------
+    try:
+
+        url = "https://en.sge.com.cn/data/data_silver_daily"
+
+        r = session.get(url, timeout=JSON_TIMEOUT)
+        r.raise_for_status()
+
+        lines = r.text.splitlines()
+
+        for line in lines:
+
+            parts = line.strip().split()
+
+            if len(parts) >= 3 and parts[1] == "SHAG":
+
+                price_kg = parse_number(parts[2])
+
+                if price_kg > 0:
+                    result["silver_cny_g"] = price_kg / 1000.0
+                    break
+
+    except Exception as e:
+        print("SGE SILVER ERROR:", e)
 
     return result
 
 
-# =========================
-# ABC API LOGIC
-# =========================
+# ======================================================
+# ABC BULLION
+# ======================================================
+def find_product_by_name(products, name):
+    for p in products:
+        if p.get("itemName") == name:
+            return p
+    return None
+
+
 def fetch_abc_reference_prices():
-    """
-    Use ABC Bullion JSON product API instead of scraping HTML.
-
-    Reference products:
-    - Gold: 1oz ABC Gold Cast Bar 9999
-    - Silver: 10oz ABC Silver Cast Bar 9995
-
-    Important:
-    - purchasePrice = ABC buyback price from customer / dealer purchase price
-    - sellPrice     = ABC selling price to customer
-    """
 
     gold_products = get_json(ABC_GOLD_PRODUCTS_URL)
     silver_products = get_json(ABC_SILVER_PRODUCTS_URL)
 
-    gold_ref_product = "1oz ABC Gold Cast Bar 9999"
-    silver_ref_product = "10oz ABC Silver Cast Bar 9995"
+    gold_item = find_product_by_name(gold_products, "1oz ABC Gold Cast Bar 9999")
+    silver_item = find_product_by_name(silver_products, "10oz ABC Silver Cast Bar 9995")
 
-    gold_item = find_product_by_name(gold_products, gold_ref_product)
-    silver_item = find_product_by_name(silver_products, silver_ref_product)
+    gold_weight = parse_number(gold_item["itemShopPriceWeightOunces"])
+    silver_weight = parse_number(silver_item["itemShopPriceWeightOunces"])
 
-    if not gold_item:
-        raise ValueError(f"ABC gold reference product not found: {gold_ref_product}")
-    if not silver_item:
-        raise ValueError(f"ABC silver reference product not found: {silver_ref_product}")
+    gold_buy = parse_number(gold_item["purchasePrice"])
+    gold_sell = parse_number(gold_item["sellPrice"])
 
-    gold_weight_oz = parse_number(gold_item.get("itemShopPriceWeightOunces", 0))
-    silver_weight_oz = parse_number(silver_item.get("itemShopPriceWeightOunces", 0))
-
-    if gold_weight_oz <= 0:
-        raise ValueError("ABC gold reference product has invalid ounce weight")
-    if silver_weight_oz <= 0:
-        raise ValueError("ABC silver reference product has invalid ounce weight")
-
-    gold_buy_total = parse_number(gold_item.get("purchasePrice", 0))
-    gold_sell_total = parse_number(gold_item.get("sellPrice", 0))
-
-    silver_buy_total = parse_number(silver_item.get("purchasePrice", 0))
-    silver_sell_total = parse_number(silver_item.get("sellPrice", 0))
-
-    if gold_buy_total <= 0 or gold_sell_total <= 0:
-        raise ValueError("ABC gold reference pricing missing or invalid")
-    if silver_buy_total <= 0 or silver_sell_total <= 0:
-        raise ValueError("ABC silver reference pricing missing or invalid")
-
-    gold_buy_aud_oz = gold_buy_total / gold_weight_oz
-    gold_sell_aud_oz = gold_sell_total / gold_weight_oz
-
-    silver_buy_aud_oz = silver_buy_total / silver_weight_oz
-    silver_sell_aud_oz = silver_sell_total / silver_weight_oz
+    silver_buy = parse_number(silver_item["purchasePrice"])
+    silver_sell = parse_number(silver_item["sellPrice"])
 
     return {
-        "source": "ABC Bullion API",
-        "abc_page_time": "",
 
-        "gold_ref_product": gold_ref_product,
-        "gold_ref_category": gold_item.get("categoryName", ""),
-        "gold_ref_weight_oz": round2(gold_weight_oz),
-        "gold_buy_aud_oz": round2(gold_buy_aud_oz),
-        "gold_sell_aud_oz": round2(gold_sell_aud_oz),
+        "gold_buy_aud_oz": gold_buy / gold_weight,
+        "gold_sell_aud_oz": gold_sell / gold_weight,
 
-        "silver_ref_product": silver_ref_product,
-        "silver_ref_category": silver_item.get("categoryName", ""),
-        "silver_ref_weight_oz": round2(silver_weight_oz),
-        "silver_buy_aud_oz": round2(silver_buy_aud_oz),
-        "silver_sell_aud_oz": round2(silver_sell_aud_oz),
+        "silver_buy_aud_oz": silver_buy / silver_weight,
+        "silver_sell_aud_oz": silver_sell / silver_weight,
+
+        "source": "ABC Bullion"
     }
 
 
-# =========================
-# CORE PAYLOAD BUILDER
-# =========================
+# ======================================================
+# BUILD PAYLOAD
+# ======================================================
 def build_payload():
-    if not FX_API_KEY:
-        raise ValueError("FX_API_KEY is not set")
 
-    gold_url = f"{GOLD_API_BASE}/XAU"
-    silver_url = f"{GOLD_API_BASE}/XAG"
+    gold_data = get_json(f"{GOLD_API_BASE}/XAU")
+    silver_data = get_json(f"{GOLD_API_BASE}/XAG")
 
-    gold_data = get_json(gold_url)
-    silver_data = get_json(silver_url)
     fx_data = get_json(FX_API_URL)
     thai_data = get_json(THAI_GOLD_API_URL)
 
-    abc_data = None
-    abc_error = None
-    try:
-        abc_data = fetch_abc_reference_prices()
-    except Exception as abc_exc:
-        abc_error = str(abc_exc)
+    abc = fetch_abc_reference_prices()
+    shanghai = fetch_shanghai_local_prices()
 
-    shanghai_data = None
-    shanghai_error = None
-    try:
-        shanghai_data = fetch_shanghai_local_prices()
-    except Exception as sh_exc:
-        shanghai_error = str(sh_exc)
+    gold_usd = parse_number(gold_data["price"])
+    silver_usd = parse_number(silver_data["price"])
 
-    gold_usd = parse_number(gold_data.get("price"))
-    silver_usd = parse_number(silver_data.get("price"))
+    usd_aud = parse_number(fx_data["conversion_rates"]["AUD"])
+    usd_thb = parse_number(fx_data["conversion_rates"]["THB"])
+    usd_cny = parse_number(fx_data["conversion_rates"]["CNY"])
 
-    fx_rates = fx_data.get("conversion_rates", {})
-    usd_aud = parse_number(fx_rates.get("AUD", 0))
-    usd_thb = parse_number(fx_rates.get("THB", 0))
-    usd_cny = parse_number(fx_rates.get("CNY", 0))
-
-    if not usd_aud or not usd_thb or not usd_cny:
-        raise ValueError("FX data missing AUD/THB/CNY")
-
-    # =========================
-    # WORLD IMPLIED REFERENCE
-    # =========================
-    gold_spot_aud_oz = gold_usd * usd_aud
-    silver_spot_aud_oz = silver_usd * usd_aud
+    # -----------------------
+    # WORLD REF
+    # -----------------------
 
     gold_ref_cny_g = (gold_usd * usd_cny) / OZ_TO_GRAMS
     silver_ref_cny_g = (silver_usd * usd_cny) / OZ_TO_GRAMS
 
-    # =========================
-    # THAILAND
-    # =========================
-    thai_gold_bar_buy_raw = (
-        thai_data.get("response", {})
-        .get("price", {})
-        .get("gold_bar", {})
-        .get("buy")
-    ) or (
-        thai_data.get("price", {})
-        .get("gold_bar", {})
-        .get("buy")
-    ) or 0
+    gold_cny_g = shanghai["gold_cny_g"]
+    silver_cny_g = shanghai["silver_cny_g"]
 
-    thai_gold_bar_sell_raw = (
-        thai_data.get("response", {})
-        .get("price", {})
-        .get("gold_bar", {})
-        .get("sell")
-    ) or (
-        thai_data.get("price", {})
-        .get("gold_bar", {})
-        .get("sell")
-    ) or 0
-
-    thai_gold_bar_buy = parse_number(thai_gold_bar_buy_raw)
-    thai_gold_bar_sell = parse_number(thai_gold_bar_sell_raw)
-
-    # =========================
-    # AUSTRALIA
-    # =========================
-    if abc_data:
-        gold_buy_aud_oz = abc_data["gold_buy_aud_oz"]
-        gold_sell_aud_oz = abc_data["gold_sell_aud_oz"]
-        silver_buy_aud_oz = abc_data["silver_buy_aud_oz"]
-        silver_sell_aud_oz = abc_data["silver_sell_aud_oz"]
-
-        gold_premium_aud_oz = gold_sell_aud_oz - gold_spot_aud_oz
-        gold_spread_aud_oz = gold_sell_aud_oz - gold_buy_aud_oz
-        gold_buyback_discount_aud_oz = gold_spot_aud_oz - gold_buy_aud_oz
-        gold_premium_pct = safe_pct(gold_premium_aud_oz, gold_spot_aud_oz)
-
-        silver_premium_aud_oz = silver_sell_aud_oz - silver_spot_aud_oz
-        silver_spread_aud_oz = silver_sell_aud_oz - silver_buy_aud_oz
-        silver_buyback_discount_aud_oz = silver_spot_aud_oz - silver_buy_aud_oz
-        silver_premium_pct = safe_pct(silver_premium_aud_oz, silver_spot_aud_oz)
-
-        australia_payload = {
-            "source": abc_data["source"],
-            "abc_page_time": abc_data["abc_page_time"],
-
-            "gold_ref_product": abc_data["gold_ref_product"],
-            "gold_ref_category": abc_data["gold_ref_category"],
-            "gold_ref_weight_oz": abc_data["gold_ref_weight_oz"],
-
-            "silver_ref_product": abc_data["silver_ref_product"],
-            "silver_ref_category": abc_data["silver_ref_category"],
-            "silver_ref_weight_oz": abc_data["silver_ref_weight_oz"],
-
-            # Legacy fields
-            "gold_aud_oz": round2(gold_spot_aud_oz),
-            "silver_aud_oz": round2(silver_spot_aud_oz),
-            "gold_premium_aud": round2(gold_premium_aud_oz),
-            "silver_premium_aud": round2(silver_premium_aud_oz),
-
-            # Explicit fields
-            "gold_spot_aud_oz": round2(gold_spot_aud_oz),
-            "gold_sell_aud_oz": round2(gold_sell_aud_oz),
-            "gold_buy_aud_oz": round2(gold_buy_aud_oz),
-            "gold_spread_aud_oz": round2(gold_spread_aud_oz),
-            "gold_buyback_discount_aud_oz": round2(gold_buyback_discount_aud_oz),
-            "gold_premium_pct": round2(gold_premium_pct),
-
-            "silver_spot_aud_oz": round2(silver_spot_aud_oz),
-            "silver_sell_aud_oz": round2(silver_sell_aud_oz),
-            "silver_buy_aud_oz": round2(silver_buy_aud_oz),
-            "silver_spread_aud_oz": round2(silver_spread_aud_oz),
-            "silver_buyback_discount_aud_oz": round2(silver_buyback_discount_aud_oz),
-            "silver_premium_pct": round2(silver_premium_pct),
-        }
-    else:
-        australia_payload = {
-            "source": "fallback-converted-spot",
-            "abc_page_time": "",
-            "gold_ref_product": "",
-            "gold_ref_category": "",
-            "gold_ref_weight_oz": 0,
-            "silver_ref_product": "",
-            "silver_ref_category": "",
-            "silver_ref_weight_oz": 0,
-
-            # Legacy fields
-            "gold_aud_oz": round2(gold_spot_aud_oz),
-            "silver_aud_oz": round2(silver_spot_aud_oz),
-            "gold_premium_aud": 0.0,
-            "silver_premium_aud": 0.0,
-
-            # Explicit fields
-            "gold_spot_aud_oz": round2(gold_spot_aud_oz),
-            "gold_sell_aud_oz": 0.0,
-            "gold_buy_aud_oz": 0.0,
-            "gold_spread_aud_oz": 0.0,
-            "gold_buyback_discount_aud_oz": 0.0,
-            "gold_premium_pct": 0.0,
-
-            "silver_spot_aud_oz": round2(silver_spot_aud_oz),
-            "silver_sell_aud_oz": 0.0,
-            "silver_buy_aud_oz": 0.0,
-            "silver_spread_aud_oz": 0.0,
-            "silver_buyback_discount_aud_oz": 0.0,
-            "silver_premium_pct": 0.0,
-        }
-
-    # =========================
-    # CHINA / SHANGHAI
-    # =========================
-    # Truthful rule:
-    # - ref = world implied converted to CNY/g
-    # - price = real Shanghai local if configured, otherwise ref
-    # - spread = price - ref
-    # This keeps the dashboard honest.
-
-    sh_gold_local = 0.0
-    sh_silver_local = 0.0
-    china_source = "world-implied-usd-cny"
-    china_local_available = False
-
-    if shanghai_data:
-        sh_gold_local = parse_number(shanghai_data.get("gold_cny_g", 0))
-        sh_silver_local = parse_number(shanghai_data.get("silver_cny_g", 0))
-        china_source = shanghai_data.get("source", "configured-shanghai-feed")
-        china_local_available = (sh_gold_local > 0 or sh_silver_local > 0)
-
-    gold_cny_g = sh_gold_local if sh_gold_local > 0 else gold_ref_cny_g
-    silver_cny_g = sh_silver_local if sh_silver_local > 0 else silver_ref_cny_g
-
-    gold_spread_cny_g = gold_cny_g - gold_ref_cny_g
-    silver_spread_cny_g = silver_cny_g - silver_ref_cny_g
-
-    gold_spread_pct = safe_pct(gold_spread_cny_g, gold_ref_cny_g)
-    silver_spread_pct = safe_pct(silver_spread_cny_g, silver_ref_cny_g)
+    gold_spread = gold_cny_g - gold_ref_cny_g
+    silver_spread = silver_cny_g - silver_ref_cny_g
 
     payload = {
+
         "status": "ok",
         "updated_at": now_iso(),
+
         "usa": {
             "gold_usd_oz": round2(gold_usd),
             "silver_usd_oz": round2(silver_usd)
         },
-        "australia": australia_payload,
-        "thailand": {
-            "gold_bar_buy_thb": round2(thai_gold_bar_buy),
-            "gold_bar_sell_thb": round2(thai_gold_bar_sell),
-            "spread_thb": round2(abs(thai_gold_bar_sell - thai_gold_bar_buy))
-        },
+
         "china": {
-            # Price shown on SH page
+
             "gold_cny_g": round2(gold_cny_g),
             "silver_cny_g": round2(silver_cny_g),
 
-            # World implied reference shown on SH page
             "gold_ref_cny_g": round2(gold_ref_cny_g),
             "silver_ref_cny_g": round2(silver_ref_cny_g),
 
-            # Spread shown on SH page
-            "gold_spread_cny_g": round2(gold_spread_cny_g),
-            "silver_spread_cny_g": round2(silver_spread_cny_g),
-            "gold_spread_pct": round2(gold_spread_pct),
-            "silver_spread_pct": round2(silver_spread_pct),
+            "gold_spread_cny_g": round2(gold_spread),
+            "silver_spread_cny_g": round2(silver_spread),
 
-            # Legacy / compatibility fields
-            "gold_premium_cny_g": 0,
-            "silver_premium_cny_g": 0,
+            "gold_spread_pct": round2((gold_spread / gold_ref_cny_g) * 100),
+            "silver_spread_pct": round2((silver_spread / silver_ref_cny_g) * 100),
 
-            "source": china_source,
-            "local_available": china_local_available
+            "source": shanghai["source"]
         },
+
         "fx": {
-            "usd_aud": round2(usd_aud),
-            "usd_thb": round2(usd_thb),
-            "usd_cny": round2(usd_cny)
+            "usd_aud": usd_aud,
+            "usd_thb": usd_thb,
+            "usd_cny": usd_cny
         },
+
         "indicators": {
-            "gold_silver_ratio": round2(gold_usd / silver_usd) if silver_usd else None
-        },
-        "debug": {
-            "abc_api_ok": abc_data is not None,
-            "abc_error": abc_error,
-            "shanghai_api_ok": shanghai_data is not None,
-            "shanghai_error": shanghai_error,
-            "cache_hit": False
+            "gold_silver_ratio": round2(gold_usd / silver_usd)
         }
     }
 
     return payload
 
 
-# =========================
+# ======================================================
 # ROUTES
-# =========================
+# ======================================================
 @app.route("/")
 def home():
-    age = get_cached_payload_age()
-    return jsonify({
-        "service": "PapaDuke Metals API",
-        "status": "running",
-        "message": "root ok",
-        "cache_age_seconds": round(age, 2) if age is not None else None
-    })
-
-
-@app.route("/ping")
-def ping():
-    return "pong", 200
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/v1/prices")
 def prices():
-    try:
-        cached = get_cached_payload()
-        age = get_cached_payload_age()
 
-        if cached is not None and age is not None and age < CACHE_TTL_SECONDS:
-            cached_copy = dict(cached)
-            cached_copy["debug"] = dict(cached.get("debug", {}))
-            cached_copy["debug"]["cache_hit"] = True
-            cached_copy["debug"]["cache_age_seconds"] = round(age, 2)
-            return jsonify(cached_copy)
+    global _cache_payload, _cache_time
 
-        payload = build_payload()
-        set_cached_payload(payload)
-        payload["debug"]["cache_age_seconds"] = 0
-        return jsonify(payload)
+    if _cache_payload and (time.time() - _cache_time < CACHE_TTL_SECONDS):
+        return jsonify(_cache_payload)
 
-    except Exception as e:
-        print("DEBUG exception:", repr(e))
+    payload = build_payload()
 
-        cached = get_cached_payload()
-        age = get_cached_payload_age()
+    _cache_payload = payload
+    _cache_time = time.time()
 
-        if cached is not None:
-            cached_copy = dict(cached)
-            cached_copy["debug"] = dict(cached.get("debug", {}))
-            cached_copy["debug"]["cache_hit"] = True
-            cached_copy["debug"]["cache_stale_served"] = True
-            cached_copy["debug"]["cache_age_seconds"] = round(age, 2) if age is not None else None
-            cached_copy["debug"]["last_refresh_error"] = str(e)
-            return jsonify(cached_copy), 200
-
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=5000)
