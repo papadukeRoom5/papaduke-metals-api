@@ -2,9 +2,12 @@ from flask import Flask, jsonify
 import requests
 import threading
 import time
+import re
 from datetime import datetime, timezone
 
 app = Flask(__name__)
+
+APP_VERSION = "sge-am-pm-v1"
 
 # =========================
 # CONFIG
@@ -58,7 +61,10 @@ def parse_number(value):
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
-    return float(str(value).replace(",", "").replace("$", "").strip())
+    s = str(value).replace(",", "").replace("$", "").strip()
+    if not s:
+        return 0.0
+    return float(s)
 
 
 def get_json(url):
@@ -74,36 +80,17 @@ def safe_pct(change, base):
 
 
 # ======================================================
-# SGE BENCHMARK PARSER
+# SGE BENCHMARK PARSER - regex based, more tolerant
 # ======================================================
-def _extract_first_contract_row(text, contract_code):
-    """
-    Expected raw rows like:
-    20260309 SHAU 1138.44 1137.97
-    20260309 SHAG 20497 21410
-
-    Returns (trade_date, am, pm) or (None, 0.0, 0.0)
-    """
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-
-        if parts[1] != contract_code:
-            continue
-
-        trade_date = parts[0]
-        am = parse_number(parts[2])
-        pm = parse_number(parts[3])
-
-        if am > 0 and pm > 0:
-            return trade_date, am, pm
-
-    return None, 0.0, 0.0
+def extract_sge_row(text, contract_code):
+    pattern = rf"(\d{{8}})\s+{contract_code}\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)"
+    m = re.search(pattern, text)
+    if not m:
+        return "", 0.0, 0.0
+    trade_date = m.group(1)
+    am = parse_number(m.group(2))
+    pm = parse_number(m.group(3))
+    return trade_date, am, pm
 
 
 def fetch_shanghai_benchmark_prices():
@@ -117,51 +104,49 @@ def fetch_shanghai_benchmark_prices():
         "silver_pm_cny_g": 0.0,
         "silver_spread_cny_g": 0.0,
         "silver_move_pct": 0.0,
-        "source": "SGE Benchmark"
+        "source": "SGE Benchmark",
+        "ok_gold": False,
+        "ok_silver": False,
+        "error_gold": None,
+        "error_silver": None,
     }
 
-    # -----------------------
-    # GOLD (already CNY/g)
-    # -----------------------
     try:
         r = session.get(SGE_GOLD_URL, timeout=JSON_TIMEOUT)
         r.raise_for_status()
-
-        trade_date, am, pm = _extract_first_contract_row(r.text, "SHAU")
+        trade_date, am, pm = extract_sge_row(r.text, "SHAU")
         if am > 0 and pm > 0:
             spread = pm - am
-            result["trade_date"] = trade_date or ""
+            result["trade_date"] = trade_date
             result["gold_am_cny_g"] = am
             result["gold_pm_cny_g"] = pm
             result["gold_spread_cny_g"] = spread
             result["gold_move_pct"] = safe_pct(spread, am)
-
+            result["ok_gold"] = True
+        else:
+            result["error_gold"] = "SHAU row not found"
     except Exception as e:
-        print("SGE GOLD ERROR:", e)
+        result["error_gold"] = str(e)
 
-    # -----------------------
-    # SILVER (SGE gives CNY/kg -> convert to CNY/g)
-    # -----------------------
     try:
         r = session.get(SGE_SILVER_URL, timeout=JSON_TIMEOUT)
         r.raise_for_status()
-
-        trade_date, am_kg, pm_kg = _extract_first_contract_row(r.text, "SHAG")
+        trade_date, am_kg, pm_kg = extract_sge_row(r.text, "SHAG")
         if am_kg > 0 and pm_kg > 0:
             am_g = am_kg / 1000.0
             pm_g = pm_kg / 1000.0
             spread_g = pm_g - am_g
-
             if not result["trade_date"]:
-                result["trade_date"] = trade_date or ""
-
+                result["trade_date"] = trade_date
             result["silver_am_cny_g"] = am_g
             result["silver_pm_cny_g"] = pm_g
             result["silver_spread_cny_g"] = spread_g
             result["silver_move_pct"] = safe_pct(spread_g, am_g)
-
+            result["ok_silver"] = True
+        else:
+            result["error_silver"] = "SHAG row not found"
     except Exception as e:
-        print("SGE SILVER ERROR:", e)
+        result["error_silver"] = str(e)
 
     return result
 
@@ -207,7 +192,6 @@ def fetch_abc_reference_prices():
 def build_payload():
     gold_data = get_json(f"{GOLD_API_BASE}/XAU")
     silver_data = get_json(f"{GOLD_API_BASE}/XAG")
-
     fx_data = get_json(FX_API_URL)
     thai_data = get_json(THAI_GOLD_API_URL)
 
@@ -221,7 +205,6 @@ def build_payload():
     usd_thb = parse_number(fx_data["conversion_rates"]["THB"])
     usd_cny = parse_number(fx_data["conversion_rates"]["CNY"])
 
-    # Australia spot reference
     gold_spot_aud_oz = gold_usd * usd_aud
     silver_spot_aud_oz = silver_usd * usd_aud
 
@@ -231,7 +214,6 @@ def build_payload():
     gold_buyback_discount_aud_oz = gold_spot_aud_oz - abc["gold_buy_aud_oz"]
     silver_buyback_discount_aud_oz = silver_spot_aud_oz - abc["silver_buy_aud_oz"]
 
-    # China world reference kept for future comparison/debug
     gold_ref_cny_g = (gold_usd * usd_cny) / OZ_TO_GRAMS
     silver_ref_cny_g = (silver_usd * usd_cny) / OZ_TO_GRAMS
 
@@ -240,6 +222,7 @@ def build_payload():
 
     payload = {
         "status": "ok",
+        "api_version": APP_VERSION,
         "updated_at": now_iso(),
 
         "usa": {
@@ -277,12 +260,11 @@ def build_payload():
         },
 
         "china": {
-            # keep latest price aliases for compatibility
-            "gold_cny_g": round2(china_gold_pm),
-            "silver_cny_g": round2(china_silver_pm),
-
-            # new proper SGE AM/PM model
             "trade_date": shanghai["trade_date"],
+
+            "gold_cny_g": round2(china_gold_pm),
+            "silver_cny_g": round4(china_silver_pm),
+
             "gold_am_cny_g": round2(shanghai["gold_am_cny_g"]),
             "gold_pm_cny_g": round2(shanghai["gold_pm_cny_g"]),
             "gold_spread_cny_g": round2(shanghai["gold_spread_cny_g"]),
@@ -293,7 +275,6 @@ def build_payload():
             "silver_spread_cny_g": round4(shanghai["silver_spread_cny_g"]),
             "silver_move_pct": round2(shanghai["silver_move_pct"]),
 
-            # world reference kept for later if you want premium-vs-world page
             "gold_ref_cny_g": round2(gold_ref_cny_g),
             "silver_ref_cny_g": round4(silver_ref_cny_g),
 
@@ -317,6 +298,13 @@ def build_payload():
 
         "indicators": {
             "gold_silver_ratio": round2(gold_usd / silver_usd)
+        },
+
+        "debug": {
+            "sge_gold_ok": shanghai["ok_gold"],
+            "sge_silver_ok": shanghai["ok_silver"],
+            "sge_gold_error": shanghai["error_gold"],
+            "sge_silver_error": shanghai["error_silver"]
         }
     }
 
@@ -328,7 +316,7 @@ def build_payload():
 # ======================================================
 @app.route("/")
 def home():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "api_version": APP_VERSION})
 
 
 @app.route("/api/v1/prices")
