@@ -18,7 +18,7 @@ ABC_SILVER_PRODUCTS_URL = "https://new-api.abcbullion.com.au/api/products?parent
 
 OZ_TO_GRAMS = 31.1034768
 
-FX_API_KEY = os.environ.get("FX_API_KEY")
+FX_API_KEY = "d97e47cfb06d344fb3fffdc1"
 FX_API_URL = f"https://v6.exchangerate-api.com/v6/{FX_API_KEY}/latest/USD"
 
 HTTP_HEADERS = {
