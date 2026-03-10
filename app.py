@@ -10,7 +10,7 @@ app = Flask(__name__)
 # =========================
 # CONFIG
 # =========================
-APP_VERSION = "sge-am-pm-v4"
+APP_VERSION = "sge-am-pm-v5"
 
 GOLD_API_BASE = "https://api.gold-api.com/price"
 THAI_GOLD_API_URL = "https://api.chnwt.dev/thai-gold-api/latest"
@@ -34,6 +34,8 @@ HTTP_HEADERS = {
 
 JSON_TIMEOUT = 12
 CACHE_TTL_SECONDS = 55
+HTTP_RETRIES = 3
+HTTP_BACKOFF_SECONDS = 1.5
 
 session = requests.Session()
 session.headers.update(HTTP_HEADERS)
@@ -44,6 +46,29 @@ session.headers.update(HTTP_HEADERS)
 _cache_lock = threading.Lock()
 _cache_payload = None
 _cache_time = 0.0
+
+# =========================
+# LAST GOOD FALLBACKS
+# =========================
+_last_good_shanghai = {
+    "trade_date": "",
+    "gold_am_cny_g": 0.0,
+    "gold_pm_cny_g": 0.0,
+    "gold_spread_cny_g": 0.0,
+    "gold_move_pct": 0.0,
+    "silver_am_cny_g": 0.0,
+    "silver_pm_cny_g": 0.0,
+    "silver_effective_cny_g": 0.0,
+    "silver_spread_cny_g": 0.0,
+    "silver_move_pct": 0.0,
+    "source": "SGE Benchmark",
+    "ok_gold": False,
+    "ok_silver": False,
+    "error_gold": None,
+    "error_silver": None,
+    "gold_mode": "",
+    "silver_mode": ""
+}
 
 
 def round2(v):
@@ -74,9 +99,24 @@ def parse_number(value):
         return 0.0
 
 
+def http_get_with_retry(url, timeout=JSON_TIMEOUT, retries=HTTP_RETRIES, backoff=HTTP_BACKOFF_SECONDS):
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(backoff * (attempt + 1))
+
+    raise last_error
+
+
 def get_json(url):
-    r = session.get(url, timeout=JSON_TIMEOUT)
-    r.raise_for_status()
+    r = http_get_with_retry(url)
     return r.json()
 
 
@@ -96,26 +136,69 @@ def safe_fetch(name, func, fallback, errors):
 
 
 # ======================================================
-# SGE BENCHMARK PARSER
+# SGE BENCHMARK PARSER - ROBUST VERSION
 # ======================================================
-def extract_sge_row(text, contract_code):
+def clean_html_text(text):
     cleaned = re.sub(r"<[^>]+>", " ", text)
     cleaned = cleaned.replace("&nbsp;", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
-    pattern = r"(\d{8})\s+" + re.escape(contract_code) + r"\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)"
-    m = re.search(pattern, cleaned)
 
-    if not m:
-        return "", 0.0, 0.0
+def extract_all_sge_rows(text, contract_code):
+    cleaned = clean_html_text(text)
 
-    trade_date = m.group(1)
-    am = parse_number(m.group(2))
-    pm = parse_number(m.group(3))
-    return trade_date, am, pm
+    pattern = (
+        r"(\d{8})\s+"
+        + re.escape(contract_code)
+        + r"\s+([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)"
+    )
+
+    matches = re.findall(pattern, cleaned)
+    rows = []
+
+    for trade_date, am, pm in matches:
+        rows.append({
+            "trade_date": trade_date,
+            "am": parse_number(am),
+            "pm": parse_number(pm),
+        })
+
+    return rows
+
+
+def choose_best_sge_row(rows):
+    if not rows:
+        return None, "no rows found"
+
+    rows_sorted = sorted(rows, key=lambda x: x["trade_date"], reverse=True)
+
+    for row in rows_sorted:
+        if row["pm"] > 0:
+            return {
+                "trade_date": row["trade_date"],
+                "am": row["am"],
+                "pm": row["pm"],
+                "effective": row["pm"],
+                "mode": "pm"
+            }, None
+
+    for row in rows_sorted:
+        if row["am"] > 0:
+            return {
+                "trade_date": row["trade_date"],
+                "am": row["am"],
+                "pm": row["pm"],
+                "effective": row["am"],
+                "mode": "am_fallback"
+            }, None
+
+    return None, "rows found but all AM/PM values are zero"
 
 
 def fetch_shanghai_benchmark_prices():
+    global _last_good_shanghai
+
     result = {
         "trade_date": "",
         "gold_am_cny_g": 0.0,
@@ -124,6 +207,7 @@ def fetch_shanghai_benchmark_prices():
         "gold_move_pct": 0.0,
         "silver_am_cny_g": 0.0,
         "silver_pm_cny_g": 0.0,
+        "silver_effective_cny_g": 0.0,
         "silver_spread_cny_g": 0.0,
         "silver_move_pct": 0.0,
         "source": "SGE Benchmark",
@@ -131,50 +215,112 @@ def fetch_shanghai_benchmark_prices():
         "ok_silver": False,
         "error_gold": None,
         "error_silver": None,
+        "gold_mode": "",
+        "silver_mode": ""
     }
 
+    # ----------------------
+    # GOLD
+    # ----------------------
     try:
-        r = session.get(SGE_GOLD_URL, timeout=JSON_TIMEOUT)
-        r.raise_for_status()
+        r = http_get_with_retry(SGE_GOLD_URL)
+        gold_rows = extract_all_sge_rows(r.text, "SHAU")
+        chosen_gold, gold_err = choose_best_sge_row(gold_rows)
 
-        trade_date, am, pm = extract_sge_row(r.text, "SHAU")
-        if am > 0 and pm > 0:
-            spread = pm - am
-            result["trade_date"] = trade_date
-            result["gold_am_cny_g"] = am
-            result["gold_pm_cny_g"] = pm
-            result["gold_spread_cny_g"] = spread
-            result["gold_move_pct"] = safe_pct(spread, am)
+        if chosen_gold:
+            am_g = chosen_gold["am"]
+            pm_g = chosen_gold["pm"]
+            effective_g = chosen_gold["effective"]
+            spread_g = (pm_g - am_g) if (am_g > 0 and pm_g > 0) else 0.0
+            move_pct = safe_pct(spread_g, am_g) if (am_g > 0 and pm_g > 0) else 0.0
+
+            result["trade_date"] = chosen_gold["trade_date"]
+            result["gold_am_cny_g"] = am_g
+            result["gold_pm_cny_g"] = pm_g if pm_g > 0 else effective_g
+            result["gold_spread_cny_g"] = spread_g
+            result["gold_move_pct"] = move_pct
             result["ok_gold"] = True
+            result["gold_mode"] = chosen_gold["mode"]
+
+            if chosen_gold["mode"] == "am_fallback":
+                result["error_gold"] = "PM not published yet, using AM"
+            else:
+                result["error_gold"] = None
         else:
-            result["error_gold"] = "SHAU row not found"
+            result["error_gold"] = gold_err or "unknown gold parse failure"
 
     except Exception as e:
         result["error_gold"] = str(e)
 
+    # ----------------------
+    # SILVER
+    # ----------------------
     try:
-        r = session.get(SGE_SILVER_URL, timeout=JSON_TIMEOUT)
-        r.raise_for_status()
+        r = http_get_with_retry(SGE_SILVER_URL)
+        silver_rows = extract_all_sge_rows(r.text, "SHAG")
+        chosen_silver, silver_err = choose_best_sge_row(silver_rows)
 
-        trade_date, am_kg, pm_kg = extract_sge_row(r.text, "SHAG")
-        if am_kg > 0 and pm_kg > 0:
-            am_g = am_kg / 1000.0
-            pm_g = pm_kg / 1000.0
-            spread_g = pm_g - am_g
+        if chosen_silver:
+            am_g = chosen_silver["am"] / 1000.0 if chosen_silver["am"] > 0 else 0.0
+            pm_g = chosen_silver["pm"] / 1000.0 if chosen_silver["pm"] > 0 else 0.0
+            effective_g = chosen_silver["effective"] / 1000.0 if chosen_silver["effective"] > 0 else 0.0
+
+            spread_g = (pm_g - am_g) if (am_g > 0 and pm_g > 0) else 0.0
+            move_pct = safe_pct(spread_g, am_g) if (am_g > 0 and pm_g > 0) else 0.0
 
             if not result["trade_date"]:
-                result["trade_date"] = trade_date
+                result["trade_date"] = chosen_silver["trade_date"]
 
             result["silver_am_cny_g"] = am_g
             result["silver_pm_cny_g"] = pm_g
+            result["silver_effective_cny_g"] = effective_g
             result["silver_spread_cny_g"] = spread_g
-            result["silver_move_pct"] = safe_pct(spread_g, am_g)
+            result["silver_move_pct"] = move_pct
             result["ok_silver"] = True
+            result["silver_mode"] = chosen_silver["mode"]
+
+            if chosen_silver["mode"] == "am_fallback":
+                result["error_silver"] = "PM not published yet, using AM"
+            else:
+                result["error_silver"] = None
         else:
-            result["error_silver"] = "SHAG row not found"
+            result["error_silver"] = silver_err or "unknown silver parse failure"
 
     except Exception as e:
         result["error_silver"] = str(e)
+
+    # ----------------------
+    # LAST GOOD FALLBACK
+    # ----------------------
+    if not result["ok_silver"] and _last_good_shanghai.get("ok_silver"):
+        result["silver_am_cny_g"] = _last_good_shanghai.get("silver_am_cny_g", 0.0)
+        result["silver_pm_cny_g"] = _last_good_shanghai.get("silver_pm_cny_g", 0.0)
+        result["silver_effective_cny_g"] = _last_good_shanghai.get("silver_effective_cny_g", 0.0)
+        result["silver_spread_cny_g"] = _last_good_shanghai.get("silver_spread_cny_g", 0.0)
+        result["silver_move_pct"] = _last_good_shanghai.get("silver_move_pct", 0.0)
+
+        if not result["trade_date"]:
+            result["trade_date"] = _last_good_shanghai.get("trade_date", "")
+
+        result["ok_silver"] = True
+        result["silver_mode"] = "last_good_fallback"
+        result["error_silver"] = f"Using last good silver data because current fetch failed: {result['error_silver']}"
+
+    if not result["ok_gold"] and _last_good_shanghai.get("ok_gold"):
+        result["gold_am_cny_g"] = _last_good_shanghai.get("gold_am_cny_g", 0.0)
+        result["gold_pm_cny_g"] = _last_good_shanghai.get("gold_pm_cny_g", 0.0)
+        result["gold_spread_cny_g"] = _last_good_shanghai.get("gold_spread_cny_g", 0.0)
+        result["gold_move_pct"] = _last_good_shanghai.get("gold_move_pct", 0.0)
+
+        if not result["trade_date"]:
+            result["trade_date"] = _last_good_shanghai.get("trade_date", "")
+
+        result["ok_gold"] = True
+        result["gold_mode"] = "last_good_fallback"
+        result["error_gold"] = f"Using last good gold data because current fetch failed: {result['error_gold']}"
+
+    if result["ok_gold"] or result["ok_silver"]:
+        _last_good_shanghai = result.copy()
 
     return result
 
@@ -251,6 +397,7 @@ def fetch_thai_silver():
         "source": "Bowins"
     }
 
+
 # ======================================================
 # BUILD PAYLOAD
 # ======================================================
@@ -309,6 +456,7 @@ def build_payload():
             "gold_move_pct": 0.0,
             "silver_am_cny_g": 0.0,
             "silver_pm_cny_g": 0.0,
+            "silver_effective_cny_g": 0.0,
             "silver_spread_cny_g": 0.0,
             "silver_move_pct": 0.0,
             "source": "SGE Benchmark",
@@ -316,6 +464,8 @@ def build_payload():
             "ok_silver": False,
             "error_gold": "fallback",
             "error_silver": "fallback",
+            "gold_mode": "",
+            "silver_mode": ""
         },
         errors
     )
@@ -357,8 +507,8 @@ def build_payload():
     gold_ref_cny_g = (gold_usd * usd_cny) / OZ_TO_GRAMS if usd_cny > 0 else 0.0
     silver_ref_cny_g = (silver_usd * usd_cny) / OZ_TO_GRAMS if usd_cny > 0 else 0.0
 
-    china_gold_pm = shanghai["gold_pm_cny_g"]
-    china_silver_pm = shanghai["silver_pm_cny_g"]
+    china_gold_value = shanghai["gold_pm_cny_g"] if shanghai["gold_pm_cny_g"] > 0 else shanghai["gold_am_cny_g"]
+    china_silver_value = shanghai.get("silver_effective_cny_g", 0.0)
 
     thai_gold_bar_buy = parse_number(
         thai_data.get("response", {})
@@ -376,8 +526,12 @@ def build_payload():
 
     gold_silver_ratio = round2(gold_usd / silver_usd) if silver_usd > 0 else 0.0
 
+    status = "ok"
+    if errors:
+        status = "partial"
+
     payload = {
-        "status": "ok",
+        "status": status,
         "api_version": APP_VERSION,
         "updated_at": now_iso(),
 
@@ -416,10 +570,11 @@ def build_payload():
         },
 
         "china": {
-            "gold_cny_g": round2(china_gold_pm),
-            "silver_cny_g": round4(china_silver_pm),
+            "gold_cny_g": round2(china_gold_value),
+            "silver_cny_g": round4(china_silver_value),
 
             "trade_date": shanghai["trade_date"],
+
             "gold_am_cny_g": round2(shanghai["gold_am_cny_g"]),
             "gold_pm_cny_g": round2(shanghai["gold_pm_cny_g"]),
             "gold_spread_cny_g": round2(shanghai["gold_spread_cny_g"]),
@@ -427,6 +582,7 @@ def build_payload():
 
             "silver_am_cny_g": round4(shanghai["silver_am_cny_g"]),
             "silver_pm_cny_g": round4(shanghai["silver_pm_cny_g"]),
+            "silver_effective_cny_g": round4(shanghai["silver_effective_cny_g"]),
             "silver_spread_cny_g": round4(shanghai["silver_spread_cny_g"]),
             "silver_move_pct": round2(shanghai["silver_move_pct"]),
 
@@ -467,7 +623,9 @@ def build_payload():
             "sge_gold_ok": shanghai["ok_gold"],
             "sge_silver_ok": shanghai["ok_silver"],
             "sge_gold_error": shanghai["error_gold"],
-            "sge_silver_error": shanghai["error_silver"]
+            "sge_silver_error": shanghai["error_silver"],
+            "sge_gold_mode": shanghai.get("gold_mode", ""),
+            "sge_silver_mode": shanghai.get("silver_mode", "")
         },
 
         "errors": errors
